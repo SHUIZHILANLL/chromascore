@@ -1,0 +1,23 @@
+﻿# 运行时产物
+*.exe
+build/
+dist/
+__pycache__/
+*.py[cod]
+cache.json
+.chromascore_cache.json
+ui/
+ui-v*/
+
+# 用户音乐不在仓库内
+*.mp3
+*.flac
+*.m4a
+*.wav
+*.ogg
+
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
