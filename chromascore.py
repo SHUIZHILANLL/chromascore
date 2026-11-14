@@ -55,7 +55,10 @@ QCOLOR = {"明亮激昂": "#e8a04f", "温暖平静": "#5fd6a8",
           "紧张暗涌": "#d468a8", "阴郁低沉": "#7b8fd0"}
 
 WIN_SEC = 4.0
-STATE = {"tracks": [], "lock": threading.Lock(), "done": 0, "total": 0, "running": False}
+# gen：曲库代际。每次换库/重新扫描 +1，旧的分析线程看到代际变了就自己退场，
+# 否则旧线程跑完会把 STATE["done"] / running 写回旧值，前端以为分析早就结束。
+STATE = {"tracks": [], "lock": threading.Lock(), "done": 0, "total": 0,
+         "running": False, "root": "", "gen": 0, "phase": ""}
 
 
 # --------------------------------------------------------------------------- #
@@ -328,9 +331,12 @@ def cover_bytes(t: dict) -> tuple[bytes, str]:
     return data, mime
 
 
-def scan(root: str) -> list[dict]:
+def scan(root: str, should_abort=None) -> list[dict]:
+    """遍历目录收集音频。单个文件读不出来就跳过，不能让一首坏歌炸掉整个换库流程。"""
     files = []
-    for dirpath, dirnames, names in os.walk(root):
+    for dirpath, dirnames, names in os.walk(root, onerror=lambda e: None):
+        if should_abort and should_abort():
+            return []
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for nm in names:
             if nm.lower().endswith(AUDIO_EXT) and not nm.startswith("."):
@@ -338,11 +344,18 @@ def scan(root: str) -> list[dict]:
     files.sort(key=lambda p: os.path.basename(p).lower())
 
     tracks = []
-    for i, p in enumerate(files):
-        st = os.stat(p)
-        m = read_meta(p, want_cover=False)
+    for p in files:
+        if should_abort and should_abort():
+            return []
+        try:
+            st = os.stat(p)
+            if st.st_size <= 0:
+                continue
+            m = read_meta(p, want_cover=False)
+        except Exception:
+            continue
         tracks.append({
-            "i": i,
+            "i": len(tracks),
             "path": p,
             "name": m["title"],
             "artist": m["artist"],
@@ -377,12 +390,20 @@ def load_cache(path: str) -> dict:
     return {}
 
 
+_CACHE_LOCK = threading.Lock()
+
+
 def save_cache(path: str, cache: dict) -> None:
+    """写缓存。换库时新旧两个分析线程可能同时在写同一个 cache.json，
+    直接整体覆盖会把对方刚算出来的条目抹掉，所以先合并磁盘上的再落盘。"""
     tmp = path + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        with _CACHE_LOCK:
+            merged = load_cache(path)
+            merged.update(cache)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False)
+            os.replace(tmp, path)
     except Exception:
         pass
 
@@ -515,9 +536,25 @@ def prewarm_covers(n: int = 60) -> None:
             pass
 
 
-def analyze_all(root: str, cache_path: str) -> None:
+def _be_nice() -> None:
+    """分析是后台活，线程优先级降到正常以下，别跟音频解码/UI 抢 CPU。
+    音频偶尔的爆音多半就是解码线程被 4 个 librosa worker 挤掉导致的。"""
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.GetCurrentThread()
+        ctypes.windll.kernel32.SetThreadPriority(h, -2)  # THREAD_PRIORITY_BELOW_NORMAL
+    except Exception:
+        pass
+
+
+def analyze_all(root: str, cache_path: str, gen: int = -1) -> None:
+    _be_nice()
     cache = load_cache(cache_path)
     tracks = STATE["tracks"]
+
+    def stale() -> bool:
+        return gen >= 0 and STATE.get("gen") != gen
+
     todo = []
     for t in tracks:
         k = cache_key(t)
@@ -526,10 +563,15 @@ def analyze_all(root: str, cache_path: str) -> None:
         else:
             todo.append(t)
 
+    if stale():
+        return
     with STATE["lock"]:
+        if gen >= 0 and STATE.get("gen") != gen:
+            return
         STATE["total"] = len(tracks)
         STATE["done"] = len(tracks) - len(todo)
         STATE["running"] = bool(todo)
+        STATE["phase"] = "analyze" if todo else ""
 
     # 封面预热排在分析之前，保证首屏立刻好看
     prewarm_covers(60)
@@ -537,11 +579,13 @@ def analyze_all(root: str, cache_path: str) -> None:
     if not todo:
         return
 
-    workers = max(1, min(4, (os.cpu_count() or 4) - 2))
+    workers = max(1, min(3, (os.cpu_count() or 4) - 2))
     lock = threading.Lock()
     counter = {"n": 0}
 
     def job(t):
+        if stale():
+            return
         try:
             res = analyze_one(t["path"])
         except Exception:
@@ -552,17 +596,21 @@ def analyze_all(root: str, cache_path: str) -> None:
                 t.update(res)
                 cache[cache_key(t)] = res
             with STATE["lock"]:
-                STATE["done"] = len(tracks) - len(todo) + counter["n"]
-            if counter["n"] % 8 == 0:
+                # 换库之后旧线程一律不许再碰进度，否则前端会被它带偏
+                if gen < 0 or STATE.get("gen") == gen:
+                    STATE["done"] = len(tracks) - len(todo) + counter["n"]
+            if counter["n"] % 8 == 0 and not stale():
                 save_cache(cache_path, cache)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(job, todo))
 
-    save_cache(cache_path, cache)
+    if not stale():                 # 换库后旧线程别再去动缓存和进度
+        save_cache(cache_path, cache)
     with STATE["lock"]:
-        STATE["running"] = False
-        STATE["done"] = len(tracks)
+        if gen < 0 or STATE.get("gen") == gen:
+            STATE["running"] = False
+            STATE["done"] = len(tracks)
 
 
 # --------------------------------------------------------------------------- #
@@ -570,6 +618,9 @@ def analyze_all(root: str, cache_path: str) -> None:
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
     server_version = "ChromaScore"
+    # HTTP/1.1 才有 keep-alive：音频 Range 请求不用每次重开 TCP。
+    # 1.0 下 Chromium 每个分片都新建连接，缓冲接不上时就是那几声「滋啦」。
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
         pass
@@ -607,26 +658,23 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
 
         if u.path == "/api/set-library":
-            d = ""
             try:
-                w = WIN.get("w")
-                if w is not None:
-                    import webview
-                    res = w.create_file_dialog(webview.FOLDER_DIALOG)
-                    if res:
-                        d = res[0] if isinstance(res, (list, tuple)) else str(res)
-            except Exception:
-                d = ""
+                d = pick_folder()
+            except Exception as e:
+                self._json({"ok": False, "reason": "dialog failed: %s" % e}, 500)
+                return
             if not d:
-                d = ask_folder()
-            if not d or not os.path.isdir(d):
                 self._json({"ok": False, "reason": "cancelled"})
+                return
+            if not os.path.isdir(d):
+                self._json({"ok": False, "reason": "not a folder: %s" % d})
                 return
             cfg = load_config()
             cfg["library"] = d
             save_config(cfg)
-            n = start_scan_analyze(d)
-            self._json({"ok": True, "library": d, "tracks": n})
+            # 异步扫描：大目录也不会把这次请求卡死，前端轮询就能看到列表刷新
+            start_scan_analyze(d, wait=False)
+            self._json({"ok": True, "library": d, "tracks": 0, "scanning": True})
             return
 
         if u.path == "/api/rescan":
@@ -634,8 +682,8 @@ class Handler(BaseHTTPRequestHandler):
             if not root or not os.path.isdir(root):
                 self._json({"ok": False, "reason": "no library"}, 400)
                 return
-            n = start_scan_analyze(root)
-            self._json({"ok": True, "tracks": n})
+            start_scan_analyze(root, wait=False)
+            self._json({"ok": True, "library": root, "scanning": True})
             return
 
         if u.path == "/api/quit":
@@ -679,13 +727,20 @@ class Handler(BaseHTTPRequestHandler):
             self._html(body)
             return
 
+        if u.path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if u.path == "/api/status":
             cpath = os.path.join(app_dir(), "cache.json")
             csize = os.path.getsize(cpath) if os.path.exists(cpath) else 0
             with STATE["lock"]:
                 done, total, running = STATE["done"], STATE["total"], STATE["running"]
+                phase, gen, root = STATE.get("phase", ""), STATE.get("gen", 0), STATE.get("root", "")
             self._json({
-                "library": STATE.get("root", ""),
+                "library": root, "phase": phase, "gen": gen,
                 "done": done, "total": total, "running": running,
                 "cache_bytes": csize,
                 "version": "1.0",
@@ -696,8 +751,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/tracks":
             with STATE["lock"]:
                 done, total, running = STATE["done"], STATE["total"], STATE["running"]
+                phase, gen, root = STATE.get("phase", ""), STATE.get("gen", 0), STATE.get("root", "")
+                tracks = list(STATE["tracks"])
             out = []
-            for t in STATE["tracks"]:
+            for t in tracks:
                 out.append({
                     "i": t["i"], "name": t["name"], "artist": t["artist"],
                     "duration": round(t["duration"], 2), "segs": t["segs"],
@@ -706,7 +763,8 @@ class Handler(BaseHTTPRequestHandler):
                     "color": t["color"], "verdict": t["verdict"],
                 })
             self._json({"tracks": out, "done": done, "total": total,
-                        "running": running})
+                        "running": running, "library": root, "phase": phase,
+                        "gen": gen})
             return
 
         if u.path == "/cover":
@@ -757,21 +815,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
+        sent = 0
         try:
-            with open(path, "rb") as f:
+            with open(path, "rb", buffering=0) as f:
                 f.seek(start)
                 left = length
                 while left > 0:
-                    chunk = f.read(min(65536, left))
+                    chunk = f.read(min(262144, left))
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+                    sent += len(chunk)
                     left -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+        except OSError:
+            # 文件被删/被占用：头已经发出去了，只能把连接掐掉，让浏览器重试
+            self.close_connection = True
+        finally:
+            if sent != length:
+                # 少发了字节，这条 keep-alive 连接不能再复用
+                self.close_connection = True
 
 
 # --------------------------------------------------------------------------- #
@@ -910,6 +979,8 @@ main{position:relative;z-index:1;padding:22px 28px 150px;max-width:1500px;
 .viz{position:fixed;inset:0;z-index:60;display:none;background:transparent}
 body.is-viz .viz{display:block}
 body.is-viz .top,body.is-viz main,body.is-viz .player{visibility:hidden}
+/* 可视化层 z-index 比抽屉高，抽屉留着就被 HUD 压住，干脆整条藏掉 */
+body.is-viz #drawer{display:none}
 body.is-viz .veil{opacity:0}
 body.is-viz #bg{opacity:1 !important}
 .viz::before{content:'';position:absolute;inset:0;pointer-events:none;
@@ -964,6 +1035,9 @@ body.is-viz #bg{opacity:1 !important}
 .mbtn.primary{background:#7ee0c0;border-color:#7ee0c0;color:#0a0a0e;font-weight:600}
 .mbtn.primary:hover{background:#9df0d4}
 .mfoot{margin-top:16px;font-size:11.5px;color:#5e5e70;text-align:center}
+.mnote{margin-top:10px;font-size:11.5px;line-height:1.55;color:#7a7a88;
+  word-break:break-all;min-height:0}
+.mnote:empty{display:none}
 
 @media (max-width:760px){
   .top{padding:12px 14px;flex-wrap:wrap}
@@ -1022,6 +1096,7 @@ body.is-viz #bg{opacity:1 !important}
     <div class="mrow"><span>分析进度</span><b id="setAnalyzed">—</b></div>
     <div class="mrow"><span>缓存</span><b id="setCache">—</b></div>
     <div class="mrow"><span>版本</span><b id="setVer">—</b></div>
+    <div class="mnote" id="libNote"></div>
     <div class="mfoot">关闭窗口即退出程序</div>
   </div>
 </div>
@@ -1094,7 +1169,7 @@ let TRACKS = [];
 let cur = -1, W = 0, H = 0, dpr = 1;
 
 const audio = new Audio();
-audio.preload = 'metadata';
+audio.preload = 'auto';          // 提前缓冲，起播那一下不会因为边下边解而爆音
 const bg = document.getElementById('bg'), bctx = bg.getContext('2d');
 const gridEl = document.getElementById('grid');
 const dlistEl = document.getElementById('dlist');
@@ -1177,15 +1252,30 @@ function segAt(tr,t){
 }
 
 /* ---------- 音频图 ---------- */
+let volGain=null, userVol=0.85;
 function initGraph(){
   if(actx){ if(actx.state==='suspended') actx.resume(); return; }
   try{
-    actx=new (window.AudioContext||window.webkitAudioContext)();
+    // latencyHint:'playback'：按播放选缓冲，不用 interactive 那套小缓冲，
+    // 主线程偶尔卡一帧（画背景）也不会把音频饿到爆音。
+    actx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'playback'});
     const src=actx.createMediaElementSource(audio);
+    // 44.1k 的曲子在这台 48k 的声卡上要重采样，峰值会冲过 0dBFS。
+    // 直连 destination 就是硬削波——听起来就是「滋啦」「电流声」。
+    // 留 1.6dB headroom 再交给用户音量，削波就没了。
+    const trim=actx.createGain(); trim.gain.value=0.83;
+    volGain=actx.createGain(); volGain.gain.value=userVol;
     analyser=actx.createAnalyser();
     analyser.fftSize=1024; analyser.smoothingTimeConstant=0.78;
-    src.connect(analyser); analyser.connect(actx.destination);
-  }catch(e){actx=null;analyser=null;}
+    src.connect(trim); trim.connect(volGain);
+    volGain.connect(analyser); analyser.connect(actx.destination);
+    audio.volume=1;   // 元素音量关掉，音量统一走 volGain，免得两处相乘
+    vfEl.style.width=(userVol*100)+'%';
+    // MediaElementSource 一旦接上，声音就只从 AudioContext 出来了。
+    // context 停在 suspended 就是彻底静音，所以创建完立刻叫醒它。
+    if(actx.state!=='running') actx.resume().catch(()=>{});
+    setTimeout(()=>{ if(actx&&actx.state!=='running') actx.resume().catch(()=>{}); },200);
+  }catch(e){actx=null;analyser=null;volGain=null;}
 }
 
 /* ---------- 背景 ---------- */
@@ -1196,7 +1286,7 @@ for(let i=0;i<6;i++) blobs.push({
   ph:Math.random()*6.283,sp:6+Math.random()*10,hoff:(Math.random()-0.5)*280});
 
 function resize(){
-  dpr=Math.min(window.devicePixelRatio||1,2);
+  dpr=Math.min(window.devicePixelRatio||1,1.5);   // 2.0 在 4K 屏上是 8K 画布，纯浪费
   W=window.innerWidth;H=window.innerHeight;
   bg.width=W*dpr;bg.height=H*dpr;bctx.setTransform(dpr,0,0,dpr,0,0);
   const vw=vtl.clientWidth||W-64;
@@ -1206,7 +1296,7 @@ function resize(){
 }
 window.addEventListener('resize',resize);
 
-let tp=performance.now();
+let tp=performance.now(), lastFrame=0;
 function draw(now){
   const dt=Math.min(now-tp,60);tp=now;
   const vizOn=document.body.classList.contains('is-viz');
@@ -1262,7 +1352,14 @@ function draw(now){
     vro.textContent=`V ${p.v.toFixed(2)}  A ${p.a.toFixed(2)}`;
   }
 }
-function frame(now){ draw(now); requestAnimationFrame(frame); }
+function frame(now){
+  // 曲库页只是背景在飘，30fps 足够；可视化里才吃满 60fps。
+  // 全屏 canvas 每帧 6 个 radial gradient，在 4K 屏上能把 CPU 堆满，
+  // 堆满了音频解码就接不上气——这也是「有时」有电流声的来源之一。
+  const gap=document.body.classList.contains('is-viz')?16:34;
+  if(now-lastFrame>=gap){ lastFrame=now; draw(now); }
+  requestAnimationFrame(frame);
+}
 
 /* ---------- 时间轴 ---------- */
 function drawVtl(){
@@ -1288,8 +1385,11 @@ vtl.addEventListener('click',e=>{
 });
 
 /* ---------- 建界面 ---------- */
-function coverURL(i){ return '/cover?i='+i; }
-function audioURL(i){ return '/audio?i='+i; }
+// 封面/音频 URL 都带上曲库代际：换库后索引 i 指向另一首歌，
+// 但 URL 不变的话 WebView2 会从磁盘缓存里拿旧封面（就是「图片还是上一个库的」）。
+let LIBGEN = 0;
+function coverURL(i){ return '/cover?i='+i+'&g='+LIBGEN; }
+function audioURL(i){ return '/audio?i='+i+'&g='+LIBGEN; }
 
 function buildGrid(){
   gridEl.innerHTML='';
@@ -1441,6 +1541,7 @@ audio.addEventListener('play',()=>{
   playBtn.textContent='❚❚';
   document.querySelector('#vplay').textContent='❚❚';
   document.body.classList.remove('paused');
+  if(actx && actx.state==='suspended') actx.resume().catch(()=>{});
 });
 barEl.addEventListener('click',e=>{
   if(cur<0) return;
@@ -1451,6 +1552,9 @@ barEl.addEventListener('click',e=>{
 /* ---------- 可视化开关 ---------- */
 function openViz(){
   if(cur<0) return;
+  // 抽屉 z-index 比可视化层低，开着进来就会被 V/A 胶囊和 × 按钮压住，
+  // 所以进可视化先把它收掉（可视化里本来也没有打开列表的入口）
+  drawer.classList.remove('open');
   try{
     document.querySelector('.top').style.display='none';
     document.querySelector('main').style.display='none';
@@ -1538,6 +1642,15 @@ function fmtBytes(n){
   return Math.round(n/1024) + ' KB';
 }
 
+let libNote = '', pendingLib = false;
+function setLibNote(txt, bad){
+  libNote = txt || '';
+  const el = document.getElementById('libNote');
+  if(!el) return;
+  el.textContent = libNote;
+  el.style.color = bad ? '#e8798a' : '#7a7a88';
+}
+
 async function openSettings(){
   setModal.classList.add('open');
   try{
@@ -1545,9 +1658,11 @@ async function openSettings(){
     document.getElementById('setPath').textContent = s.library || '未设置';
     document.getElementById('setCount').textContent = s.total + ' 首';
     document.getElementById('setAnalyzed').textContent =
-      s.running ? `${s.done} / ${s.total}（进行中）` : `${s.done} / ${s.total}（完成）`;
+      s.phase === 'scan' ? '正在扫描目录…'
+        : (s.running ? `${s.done} / ${s.total}（进行中）` : `${s.done} / ${s.total}（完成）`);
     document.getElementById('setCache').textContent = fmtBytes(s.cache_bytes);
     document.getElementById('setVer').textContent = 'v' + s.version;
+    if(s.phase === 'scan') setLibNote('正在扫描新目录，列表马上就好…');
   }catch(e){
     document.getElementById('setPath').textContent = '读取失败';
   }
@@ -1560,40 +1675,80 @@ setModal.addEventListener('click', e=>{ if(e.target === setModal) setModal.class
 btnChange.addEventListener('click', async ()=>{
   btnChange.disabled = true;
   btnChange.textContent = '等待选择…';
+  setLibNote('');
   try{
-    const r = await (await fetch('/api/set-library',{method:'POST'})).json();
+    const res = await fetch('/api/set-library',{method:'POST'});
+    const r = await res.json();
     if(r.ok){
+      // 服务端已经换好代际、清空旧列表，这里同步清前端再拉一次
       lastSig = '';
       TRACKS = [];
       cur = -1;
+      try{ audio.pause(); audio.removeAttribute('src'); audio.load(); }catch(e){}
+      gridEl.innerHTML=''; dlistEl.innerHTML='';
+      // 播放条也一起回到空态，免得留着上一库的封面和曲名
+      try{
+        pcEl.removeAttribute('src'); pcEl.alt='';
+        ptEl.textContent='—'; paEl.textContent='';
+        pqEl.textContent=''; pmetaEl.textContent='';
+        ctEl.textContent='0:00'; dtEl.textContent='0:00'; fillEl.style.width='0%';
+        playBtn.textContent='▶';
+      }catch(e){}
+      document.title = '音色谱';
+      pendingLib = true;
+      setLibNote('已切换到 ' + r.library + '，正在扫描…');
       await pull();
-      setTimeout(openSettings, 300);
+    }else if(r.reason === 'cancelled'){
+      setLibNote('没有选择文件夹，曲库保持不变');
+    }else{
+      setLibNote('换库失败：' + (r.reason || '未知原因'), true);
     }
-  }catch(e){}
+  }catch(e){
+    setLibNote('换库失败：服务没有响应（' + e.message + '）', true);
+  }
   btnChange.disabled = false;
   btnChange.textContent = '更换曲库';
+  setTimeout(openSettings, 400);
 });
 
 btnRescan.addEventListener('click', async ()=>{
   btnRescan.disabled = true;
   btnRescan.textContent = '扫描中…';
+  setLibNote('');
   try{
-    await fetch('/api/rescan',{method:'POST'});
-    lastSig = '';
-    await pull();
-    setTimeout(openSettings, 600);
-  }catch(e){}
+    const r = await (await fetch('/api/rescan',{method:'POST'})).json();
+    if(r.ok){
+      lastSig = '';
+      setLibNote('重新扫描：' + r.library);
+      await pull();
+    }else{
+      setLibNote('重新扫描失败：' + (r.reason || '未知原因'), true);
+    }
+  }catch(e){
+    setLibNote('重新扫描失败：' + e.message, true);
+  }
   btnRescan.disabled = false;
   btnRescan.textContent = '重新扫描';
+  setTimeout(openSettings, 400);
 });
 
 /* ---------- 音量 ---------- */
 const volEl=document.getElementById('vol'),vfEl=document.getElementById('vf');
-audio.volume=0.85;
+audio.volume=userVol;
+vfEl.style.width=(userVol*100)+'%';
 volEl.addEventListener('click',e=>{
   const r=volEl.getBoundingClientRect();
-  audio.volume=Math.min(Math.max((e.clientX-r.left)/r.width,0),1);
-  vfEl.style.width=(audio.volume*100)+'%';
+  if(r.width<=0) return;
+  let v=Math.min(Math.max((e.clientX-r.left)/r.width,0),1);
+  if(!isFinite(v)) v=userVol;          // 0/0 会得到 NaN，写进 AudioParam 会直接抛错
+  userVol=v;
+  if(volGain && actx){
+    if(actx.state==='suspended') actx.resume().catch(()=>{});
+    volGain.gain.setTargetAtTime(userVol, actx.currentTime, 0.02);
+  }else{
+    audio.volume=userVol;
+  }
+  vfEl.style.width=(userVol*100)+'%';
 });
 
 /* ---------- 拉数据 ---------- */
@@ -1605,9 +1760,13 @@ async function pull(){
   try{
     const r=await fetch('/api/tracks',{cache:'no-store'});
     const d=await r.json();
-    const sig=d.tracks.map(t=>t.segs?1:0).join('')+'|'+d.done;
+    // 签名里带上 library/gen/total：换库后即使曲目数一样也一定会重画，
+    // 扫描阶段 total 从 0 变 N 也能触发一次 buildGrid。
+    const sig=(d.library||'')+'|'+(d.gen||0)+'|'+d.total+'|'+d.done+'|'+
+              d.tracks.map(t=>t.segs?1:0).join('');
     if(sig!==lastSig){
       const first=TRACKS.length===0;
+      LIBGEN = d.gen||0;          // 必须在 buildGrid 之前更新，封面 URL 靠它换版本
       TRACKS=d.tracks;
       lastSig=sig;
       if(first){
@@ -1616,9 +1775,21 @@ async function pull(){
       }
       else refreshMeta();
       applyFilter();
-      if(d.running) progEl.textContent=`分析中 ${d.done}/${d.total}`;
+      if(!TRACKS.length){
+        if(d.phase==='scan') progEl.textContent='扫描目录中…';
+        else if(d.library) progEl.textContent='这个文件夹里没有音频文件';
+      }else if(d.running){
+        progEl.textContent=`分析中 ${d.done}/${d.total}`;
+      }else{
+        progEl.textContent=`${TRACKS.length} 首`;
+      }
+      if(libNote && pendingLib && d.phase!=='scan'){
+        pendingLib = false;
+        setLibNote('曲库：' + (d.library||'—') + ' · ' + d.tracks.length +
+                   ' 首' + (d.running ? '，后台分析情绪中' : ''));
+      }
     }
-    setTimeout(pull, d.running?2500:15000);
+    setTimeout(pull, d.running||d.phase==='scan'?2500:15000);
   }catch(e){ setTimeout(pull,4000); }
 }
 
@@ -1658,19 +1829,118 @@ def pick_port(preferred: int = 8765) -> int:
     return 0
 
 
-def ask_folder() -> str:
+def ask_folder(title: str = "选择音乐文件夹", first_run: bool = False) -> str:
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox
         r = tk.Tk()
         r.withdraw()
-        messagebox.showinfo("音色谱", "第一次运行，请选择你的音乐文件夹。\n\n"
-                                      "之后会自动记住，也可在面板里更换。")
-        d = filedialog.askdirectory(title="选择音乐文件夹")
+        r.attributes("-topmost", True)
+        if first_run:
+            messagebox.showinfo("音色谱", "第一次运行，请选择你的音乐文件夹。\n\n"
+                                          "之后会自动记住，也可在面板里更换。")
+        d = filedialog.askdirectory(title=title)
         r.destroy()
         return d or ""
     except Exception:
         return ""
+
+
+def _pick_folder_native(title: str = "选择音乐文件夹"):
+    """Windows 原生「选择文件夹」（IFileOpenDialog + FOS_PICKFOLDERS）。
+
+    返回 (是否真的弹出过, 路径)。第二条为 "" 表示用户取消——调用方要能区分
+    「取消」和「弹不出来」，否则取消之后还会再弹一个框。
+    任意线程都能调：自己起 STA，不经过 tkinter，也不经过 WebView2 的消息循环。
+    """
+    if sys.platform != "win32":
+        return (False, "")
+    import ctypes
+    from ctypes import byref, c_void_p, c_ulong, c_wchar_p, POINTER, WINFUNCTYPE
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    ole32 = ctypes.WinDLL("ole32")
+    user32 = ctypes.WinDLL("user32")
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoInitializeEx.argtypes = [c_void_p, c_ulong]
+    ole32.CLSIDFromString.restype = ctypes.c_long
+    ole32.CLSIDFromString.argtypes = [c_wchar_p, POINTER(GUID)]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = [POINTER(GUID), c_void_p, c_ulong,
+                                       POINTER(GUID), POINTER(c_void_p)]
+
+    hr_init = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+    if (hr_init & 0xFFFFFFFF) == 0x80010106:
+        return (False, "")   # 这一线程已经是 MTA，弹不了模态对话框
+
+    def guid(s: str) -> GUID:
+        g = GUID()
+        if ole32.CLSIDFromString(c_wchar_p(s), byref(g)) != 0:
+            raise OSError("CLSID " + s)
+        return g
+
+    def vcall(ptr, index, restype, *argtypes):
+        vtable = ctypes.cast(ptr, POINTER(POINTER(c_void_p)))[0]
+        return WINFUNCTYPE(restype, c_void_p, *argtypes)(vtable[index])
+
+    dlg = c_void_p()
+    item = c_void_p()
+    try:
+        clsid = guid("{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}")
+        iid = guid("{d57c7288-d4ad-4768-be02-9d969532d960}")
+        if ole32.CoCreateInstance(byref(clsid), None, 1, byref(iid), byref(dlg)) != 0 or not dlg:
+            return (False, "")
+
+        opts = c_ulong(0)
+        vcall(dlg, 10, ctypes.c_long, POINTER(c_ulong))(dlg, byref(opts))   # GetOptions
+        # FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST
+        vcall(dlg, 9, ctypes.c_long, c_ulong)(dlg, opts.value | 0x20 | 0x40 | 0x08)
+        vcall(dlg, 17, ctypes.c_long, c_wchar_p)(dlg, title)                # SetTitle
+
+        owner = user32.GetForegroundWindow()
+        hr = vcall(dlg, 3, ctypes.c_long, wintypes.HWND)(dlg, owner)        # Show
+        if hr != 0:                        # 0x800704C7 = 用户取消
+            return (True, "")
+
+        if vcall(dlg, 20, ctypes.c_long, POINTER(c_void_p))(dlg, byref(item)) != 0 or not item:
+            return (True, "")
+        buf = c_wchar_p()
+        if vcall(item, 5, ctypes.c_long, c_ulong, POINTER(c_wchar_p))(
+                item, 0x80058000, byref(buf)) != 0:                        # SIGDN_FILESYSPATH
+            return (True, "")
+        return (True, buf.value or "")
+    except Exception:
+        return (False, "")
+    finally:
+        for p in (item, dlg):
+            if p:
+                try:
+                    vcall(p, 2, c_ulong)(p)   # Release
+                except Exception:
+                    pass
+        if hr_init in (0, 1):
+            ole32.CoUninitialize()
+
+
+def pick_folder(title: str = "选择音乐文件夹") -> str:
+    """换曲库的统一入口：原生选择器 → pywebview → tkinter。"""
+    shown, path = _pick_folder_native(title)
+    if shown:
+        return path
+    w = WIN.get("w")
+    if w is not None:
+        try:
+            import webview
+            res = w.create_file_dialog(webview.FOLDER_DIALOG)
+            if res is not None:
+                return res[0] if isinstance(res, (list, tuple)) else str(res)
+        except Exception:
+            pass
+    return ask_folder(title)
 
 
 def resolve_library(cli_root: str) -> str:
@@ -1680,7 +1950,7 @@ def resolve_library(cli_root: str) -> str:
     lib = cfg.get("library", "")
     if lib and os.path.isdir(lib):
         return lib
-    d = ask_folder()
+    d = ask_folder(first_run=True)
     if d:
         cfg["library"] = d
         save_config(cfg)
@@ -1690,19 +1960,48 @@ def resolve_library(cli_root: str) -> str:
 WIN = {"w": None}
 
 
-def start_scan_analyze(root: str) -> int:
-    tracks = scan(root)
-    if not tracks:
-        return 0
-    STATE["tracks"] = tracks
-    STATE["root"] = root
+def start_scan_analyze(root: str, wait: bool = True) -> int:
+    """换曲库 / 重新扫描的唯一入口。
+
+    wait=True  扫描同步做完（启动时用，立刻知道有多少首）
+    wait=False 立刻返回，扫描丢后台（网页里换曲库用：选到几万文件的大目录也不会把
+               HTTP 请求挂死成「点了没反应」，前端轮询 /api/tracks 自然能看到列表刷新）
+    """
     cache_path = os.path.join(app_dir(), "cache.json")
+
     with STATE["lock"]:
-        STATE["total"] = len(tracks)
+        STATE["gen"] += 1              # 旧的分析线程从此失效
+        gen = STATE["gen"]
+        STATE["root"] = root
+        STATE["tracks"] = []           # 先清空：换库失败也不能继续显示旧曲库
+        STATE["total"] = 0
         STATE["done"] = 0
         STATE["running"] = True
-    threading.Thread(target=analyze_all, args=(root, cache_path), daemon=True).start()
-    return len(tracks)
+        STATE["phase"] = "scan"
+
+    def run() -> int:
+        tracks = scan(root, should_abort=lambda: STATE.get("gen") != gen)
+        with STATE["lock"]:
+            if STATE["gen"] != gen:     # 扫描期间又换了一次库，这次作废
+                return 0
+            STATE["tracks"] = tracks
+            STATE["total"] = len(tracks)
+            STATE["done"] = 0
+            STATE["running"] = bool(tracks)
+            STATE["phase"] = ""
+        if not tracks:
+            return 0
+        if wait:
+            threading.Thread(target=analyze_all, args=(root, cache_path, gen),
+                             daemon=True).start()
+        else:
+            analyze_all(root, cache_path, gen)
+        return len(tracks)
+
+    if wait:
+        return run()
+    threading.Thread(target=run, daemon=True).start()
+    return 0
 
 
 def control_panel(url: str, root: str) -> None:
@@ -1745,17 +2044,16 @@ def control_panel(url: str, root: str) -> None:
         open_app_window(url)
 
     def change_lib():
-        d = ask_folder()
+        d = pick_folder()
         if not d or d == root:
             return
         cfg = load_config()
         cfg["library"] = d
         save_config(cfg)
-        n = start_scan_analyze(d)
-        if n == 0:
-            messagebox.showwarning("音色谱", "这个文件夹里没有找到音频文件。")
-            return
+        # 后台扫，别把控制面板冻住
+        start_scan_analyze(d, wait=False)
         path_var.set(d)
+        status_var.set("正在扫描新曲库…")
 
     def do_quit():
         rootw.destroy()
