@@ -743,7 +743,7 @@ class Handler(BaseHTTPRequestHandler):
                 "library": root, "phase": phase, "gen": gen,
                 "done": done, "total": total, "running": running,
                 "cache_bytes": csize,
-                "version": "1.0",
+                "version": "1.1",
                 "appdir": app_dir(),
             })
             return

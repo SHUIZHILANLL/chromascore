@@ -69,7 +69,12 @@
 
 ### 方式一：直接运行 exe（Windows）
 
-从 [Releases](../../releases) 下载 `ChromaScore.exe`，双击，选择你的音乐文件夹。
+从 [Releases](../../releases/latest) 下载 `ChromaScore.exe`，双击，选择你的音乐文件夹。
+同一页有 `ChromaScore.exe.sha256`，可以拿来校验下载是否完整：
+
+```powershell
+Get-FileHash .\ChromaScore.exe -Algorithm SHA256
+```
 
 首次运行会在 `%APPDATA%\ChromaScore\` 建立配置和分析缓存。
 

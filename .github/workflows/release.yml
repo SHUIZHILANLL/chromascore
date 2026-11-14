@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build exe
+        run: pyinstaller chromascore.spec --noconfirm --log-level WARN
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/ChromaScore.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  ChromaScore.exe" | Out-File -FilePath dist/ChromaScore.exe.sha256 -Encoding ascii
+          Get-Item dist/ChromaScore.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChromaScore-windows
+          path: dist/ChromaScore.exe
+          retention-days: 14
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: ChromaScore ${{ github.ref_name }}
+          files: |
+            dist/ChromaScore.exe
+            dist/ChromaScore.exe.sha256
+          body: |
+            Windows x64 单文件版，双击运行，首次启动会让你选音乐文件夹。
+
+            ### 本次修复
+
+            - **换曲库没反应** — 选目录改用系统原生选择器；扫描转到后台，不再把请求挂死；换库后旧的分析线程自动退场，列表和播放列表一起刷新
+            - **封面还是上一个库的** — 封面地址带上曲库代际，换库后不再命中旧缓存
+            - **偶发爆音 / 电流声** — 服务端改 HTTP/1.1 复用连接；WebAudio 增加 -1.6dB headroom，消除重采样削波；分析线程降优先级，不再和音频抢 CPU
+            - **可视化里播放列表被压住** — 进入可视化时自动收起抽屉
+
+            ### 校验
+
+            同目录的 `ChromaScore.exe.sha256` 可用于校验下载文件。
